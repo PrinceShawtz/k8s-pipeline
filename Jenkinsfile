@@ -20,10 +20,13 @@ pipeline {
                         sh '''
                             curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
                             chmod +x kubectl
-                            sudo mv kubectl /usr/local/bin/ || mv kubectl /tmp/kubectl
+                            sudo mv kubectl /usr/local/bin/ || mv kubectl /usr/local/bin/kubectl
+                            # Verify installation
+                            kubectl version --client
                         '''
                     } else {
                         echo "kubectl already installed"
+                        sh "kubectl version --client"
                     }
                 }
             }
@@ -58,15 +61,26 @@ pipeline {
                 script {
                     // Check if deployment file exists in root directory
                     if (fileExists('deployment.yaml')) {
-                        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
                             sh '''
-                                # Set up kubectl path and config
-                                export PATH="/tmp:$PATH"
-                                export KUBECONFIG=${KUBECONFIG}
+                                # Copy kubeconfig to a location we can use
+                                mkdir -p ~/.kube
+                                cp ${KUBECONFIG_FILE} ~/.kube/config
+                                chmod 600 ~/.kube/config
+                                
+                                # Set KUBECONFIG environment variable
+                                export KUBECONFIG=~/.kube/config
+                                
+                                # Verify kubeconfig format
+                                echo "Checking kubeconfig format..."
+                                if ! kubectl config view --minify > /dev/null 2>&1; then
+                                    echo "❌ Invalid kubeconfig format"
+                                    exit 1
+                                fi
                                 
                                 # Test cluster connection with timeout
                                 echo "Testing Kind cluster connection..."
-                                if timeout 30s kubectl cluster-info; then
+                                if timeout 30s kubectl cluster-info > /dev/null 2>&1; then
                                     echo "✅ Kind cluster is accessible!"
                                     
                                     # Show current context
@@ -75,17 +89,23 @@ pipeline {
                                     # Create namespace if it doesn't exist
                                     kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
                                     
-                                    # Apply the deployment
+                                    # Apply the deployment with correct variable substitution
                                     echo "Applying deployment to Kind cluster..."
-                                    sed "s|__IMAGE__|${DOCKER_REPO}:${BUILD_ID}|g; s|__NAMESPACE__|${K8S_NAMESPACE}|g" deployment.yaml | kubectl apply -f -
+                                    sed "s|__IMAGE__|${DOCKER_REPO}:${BUILD_ID}|g; s|__NAMESPACE__|${K8S_NAMESPACE}|g" deployment.yaml > deployment-final.yaml
+                                    
+                                    # Debug: show final deployment
+                                    echo "Final deployment configuration:"
+                                    cat deployment-final.yaml
+                                    
+                                    kubectl apply -f deployment-final.yaml
                                     
                                     # Wait for deployment to be ready
                                     echo "Waiting for deployment to be ready..."
-                                    kubectl wait --for=condition=available --timeout=300s deployment/k8s-pipeline-app -n ${K8S_NAMESPACE}
+                                    kubectl wait --for=condition=available --timeout=300s deployment/k8s-pipeline-deployment -n ${K8S_NAMESPACE}
                                     
                                     # Show deployment status
                                     echo "Deployment successful! Current status:"
-                                    kubectl get deployments,pods,services -n ${K8S_NAMESPACE} -l app=k8s-pipeline-app
+                                    kubectl get deployments,pods,services -n ${K8S_NAMESPACE} -l app=k8s-pipeline
                                     
                                     # Get service info
                                     echo "Service details:"
@@ -100,8 +120,17 @@ pipeline {
                                     
                                 else
                                     echo "❌ Cannot connect to Kind cluster"
-                                    echo "🔧 Make sure Kind cluster is running: kind get clusters"
+                                    echo "🔧 Troubleshooting steps:"
+                                    echo "   1. Make sure Kind cluster is running: kind get clusters"
+                                    echo "   2. Check kubeconfig: kubectl config view"
+                                    echo "   3. Verify cluster status: docker ps | grep kind"
                                     echo "📦 Docker image was still built and pushed: ${DOCKER_REPO}:${BUILD_ID}"
+                                    
+                                    # Show detailed error information
+                                    echo "Detailed cluster info:"
+                                    kubectl cluster-info || true
+                                    kubectl config get-contexts || true
+                                    
                                     currentBuild.result = 'UNSTABLE'
                                 fi
                             '''
@@ -123,8 +152,8 @@ pipeline {
             echo ""
             echo "💡 Next steps:"
             echo "   • Test your app: kubectl port-forward service/k8s-pipeline-service 8080:80 -n ${params.K8S_NAMESPACE}"
-            echo "   • View logs: kubectl logs -l app=k8s-pipeline-app -n ${params.K8S_NAMESPACE}"
-            echo "   • Scale up: kubectl scale deployment k8s-pipeline-app --replicas=3 -n ${params.K8S_NAMESPACE}"
+            echo "   • View logs: kubectl logs -l app=k8s-pipeline -n ${params.K8S_NAMESPACE}"
+            echo "   • Scale up: kubectl scale deployment k8s-pipeline-deployment --replicas=3 -n ${params.K8S_NAMESPACE}"
             
             // Clean up local Docker image to save space
             sh "docker rmi ${DOCKER_REPO}:${env.BUILD_ID} || true"
